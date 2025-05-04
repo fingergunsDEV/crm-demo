@@ -1,7 +1,28 @@
-const SHEETDB_API = 'https://sheetdb.io/api/v1/YOUR_SHEETDB_API_ID';
-let currentCustomerIndex = null;
-let salesChart = null;
-let autoRefreshInterval = null;
+// Google API Initialization
+function initGoogleAPI() {
+    gapi.load('client:auth2', () => {
+        gapi.client.init({
+            apiKey: CONFIG.API_KEY,
+            clientId: CONFIG.CLIENT_ID,
+            discoveryDocs: CONFIG.DISCOVERY_DOCS,
+            scope: CONFIG.SCOPES
+        }).then(() => {
+            gapi.auth2.getAuthInstance().isSignedIn.listen(updateSigninStatus);
+            updateSigninStatus(gapi.auth2.getAuthInstance().isSignedIn.get());
+        }).catch(error => {
+            showToast('Failed to initialize Google API', true);
+            console.error('Google API init error:', error);
+        });
+    });
+}
+
+function updateSigninStatus(isSignedIn) {
+    if (isSignedIn) {
+        initializeDashboard();
+    } else {
+        gapi.auth2.getAuthInstance().signIn();
+    }
+}
 
 // Theme toggle
 function toggleTheme() {
@@ -70,12 +91,92 @@ tabs.forEach(tab => {
     });
 });
 
+// Google Sheets API Helper Functions
+async function readSheet(sheetName, range) {
+    try {
+        const response = await gapi.client.sheets.spreadsheets.values.get({
+            spreadsheetId: CONFIG.SPREADSHEET_ID,
+            range: `${sheetName}!${range}`
+        });
+        return response.result.values || [];
+    } catch (error) {
+        showToast(`Failed to read ${sheetName}`, true);
+        console.error(`Read ${sheetName} error:`, error);
+        return [];
+    }
+}
+
+async function appendToSheet(sheetName, values) {
+    try {
+        await gapi.client.sheets.spreadsheets.values.append({
+            spreadsheetId: CONFIG.SPREADSHEET_ID,
+            range: `${sheetName}!A1`,
+            valueInputOption: 'RAW',
+            resource: {
+                values: [values]
+            }
+        });
+    } catch (error) {
+        showToast(`Failed to append to ${sheetName}`, true);
+        console.error(`Append ${sheetName} error:`, error);
+    }
+}
+
+async function updateSheet(sheetName, range, values) {
+    try {
+        await gapi.client.sheets.spreadsheets.values.update({
+            spreadsheetId: CONFIG.SPREADSHEET_ID,
+            range: `${sheetName}!${range}`,
+            valueInputOption: 'RAW',
+            resource: {
+                values: [values]
+            }
+        });
+    } catch (error) {
+        showToast(`Failed to update ${sheetName}`, true);
+        console.error(`Update ${sheetName} error:`, error);
+    }
+}
+
+async function deleteRow(sheetName, rowIndex) {
+    try {
+        const sheetMetadata = await gapi.client.sheets.spreadsheets.get({
+            spreadsheetId: CONFIG.SPREADSHEET_ID
+        });
+        const sheet = sheetMetadata.result.sheets.find(s => s.properties.title === sheetName);
+        const sheetId = sheet.properties.sheetId;
+
+        await gapi.client.sheets.spreadsheets.batchUpdate({
+            spreadsheetId: CONFIG.SPREADSHEET_ID,
+            resource: {
+                requests: [{
+                    deleteDimension: {
+                        range: {
+                            sheetId: sheetId,
+                            dimension: 'ROWS',
+                            startIndex: rowIndex,
+                            endIndex: rowIndex + 1
+                        }
+                    }
+                }]
+            }
+        });
+    } catch (error) {
+        showToast(`Failed to delete row from ${sheetName}`, true);
+        console.error(`Delete row ${sheetName} error:`, error);
+    }
+}
+
 // Customer management
 async function loadCustomers() {
     try {
         document.body.classList.add('loading');
-        const response = await axios.get(`${SHEETDB_API}?sheet=Customers`);
-        const customers = response.data || [];
+        const data = await readSheet('Customers', 'A2:C');
+        const customers = data.map(row => ({
+            name: row[0] || '',
+            email: row[1] || '',
+            date: row[2] || ''
+        }));
         const itemsPerPage = parseInt(localStorage.getItem('itemsPerPage')) || 10;
         const list = document.getElementById('customerList');
         list.innerHTML = '';
@@ -115,13 +216,7 @@ async function addCustomer() {
 
     try {
         document.body.classList.add('loading');
-        await axios.post(`${SHEETDB_API}?sheet=Customers`, {
-            data: [{
-                name,
-                email,
-                date: new Date().toISOString()
-            }]
-        });
+        await appendToSheet('Customers', [name, email, new Date().toISOString()]);
         nameInput.value = '';
         emailInput.value = '';
         await loadCustomers();
@@ -146,15 +241,8 @@ async function saveCustomer() {
 
     try {
         document.body.classList.add('loading');
-        const customers = (await axios.get(`${SHEETDB_API}?sheet=Customers`)).data;
-        const customer = customers[currentCustomerIndex];
-        await axios.patch(`${SHEETDB_API}/email/${encodeURIComponent(customer.email)}?sheet=Customers`, {
-            data: {
-                name,
-                email,
-                date: new Date().toISOString()
-            }
-        });
+        const rowIndex = currentCustomerIndex + 2; // A2 is first data row
+        await updateSheet('Customers', `A${rowIndex}:C${rowIndex}`, [name, email, new Date().toISOString()]);
         closeModal();
         await loadCustomers();
         showToast('Customer updated successfully');
@@ -169,9 +257,8 @@ async function saveCustomer() {
 async function deleteCustomer(index) {
     try {
         document.body.classList.add('loading');
-        const customers = (await axios.get(`${SHEETDB_API}?sheet=Customers`)).data;
-        const customer = customers[index];
-        await axios.delete(`${SHEETDB_API}/email/${encodeURIComponent(customer.email)}?sheet=Customers`);
+        const rowIndex = index + 2; // A2 is first data row
+        await deleteRow('Customers', rowIndex - 1); // 0-based index for API
         await loadCustomers();
         showToast('Customer deleted');
     } catch (error) {
@@ -186,8 +273,12 @@ async function searchCustomers() {
     const searchTerm = document.getElementById('searchInput').value.toLowerCase();
     try {
         document.body.classList.add('loading');
-        const response = await axios.get(`${SHEETDB_API}?sheet=Customers`);
-        const customers = response.data || [];
+        const data = await readSheet('Customers', 'A2:C');
+        const customers = data.map(row => ({
+            name: row[0] || '',
+            email: row[1] || '',
+            date: row[2] || ''
+        }));
         const itemsPerPage = parseInt(localStorage.getItem('itemsPerPage')) || 10;
         const list = document.getElementById('customerList');
         list.innerHTML = '';
@@ -222,8 +313,12 @@ async function searchCustomers() {
 async function exportCustomers() {
     try {
         document.body.classList.add('loading');
-        const response = await axios.get(`${SHEETDB_API}?sheet=Customers`);
-        const customers = response.data || [];
+        const data = await readSheet('Customers', 'A2:C');
+        const customers = data.map(row => ({
+            name: row[0] || '',
+            email: row[1] || '',
+            date: row[2] || ''
+        }));
         const csv = [
             ['Name', 'Email', 'Date'].join(','),
             ...customers.map(c => [c.name, c.email, new Date(c.date).toLocaleDateString()].join(','))
@@ -248,8 +343,12 @@ async function exportCustomers() {
 async function loadTasks() {
     try {
         document.body.classList.add('loading');
-        const response = await axios.get(`${SHEETDB_API}?sheet=Tasks`);
-        const tasks = response.data || [];
+        const data = await readSheet('Tasks', 'A2:C');
+        const tasks = data.map(row => ({
+            text: row[0] || '',
+            completed: row[1] === 'TRUE',
+            date: row[2] || ''
+        }));
         const itemsPerPage = parseInt(localStorage.getItem('itemsPerPage')) || 10;
         const list = document.getElementById('taskList');
         list.innerHTML = '';
@@ -282,13 +381,7 @@ async function addTask() {
     }
     try {
         document.body.classList.add('loading');
-        await axios.post(`${SHEETDB_API}?sheet=Tasks`, {
-            data: [{
-                text,
-                completed: false,
-                date: new Date().toISOString()
-            }]
-        });
+        await appendToSheet('Tasks', [text, 'FALSE', new Date().toISOString()]);
         input.value = '';
         await loadTasks();
         showToast('Task added');
@@ -303,13 +396,14 @@ async function addTask() {
 async function toggleTask(index) {
     try {
         document.body.classList.add('loading');
-        const tasks = (await axios.get(`${SHEETDB_API}?sheet=Tasks`)).data;
-        const task = tasks[index];
-        await axios.patch(`${SHEETDB_API}/text/${encodeURIComponent(task.text)}?sheet=Tasks`, {
-            data: {
-                completed: !task.completed
-            }
-        });
+        const data = await readSheet('Tasks', 'A2:C');
+        const task = data[index];
+        const rowIndex = index + 2;
+        await updateSheet('Tasks', `A${rowIndex}:C${rowIndex}`, [
+            task[0],
+            task[1] === 'TRUE' ? 'FALSE' : 'TRUE',
+            task[2]
+        ]);
         await loadTasks();
     } catch (error) {
         showToast('Failed to update task', true);
@@ -322,9 +416,8 @@ async function toggleTask(index) {
 async function deleteTask(index) {
     try {
         document.body.classList.add('loading');
-        const tasks = (await axios.get(`${SHEETDB_API}?sheet=Tasks`)).data;
-        const task = tasks[index];
-        await axios.delete(`${SHEETDB_API}/text/${encodeURIComponent(task.text)}?sheet=Tasks`);
+        const rowIndex = index + 2;
+        await deleteRow('Tasks', rowIndex - 1);
         await loadTasks();
         showToast('Task deleted');
     } catch (error) {
@@ -340,8 +433,12 @@ async function loadMessages() {
     const category = document.getElementById('messageCategory').value;
     try {
         document.body.classList.add('loading');
-        const response = await axios.get(`${SHEETDB_API}?sheet=Messages`);
-        const messages = response.data || [];
+        const data = await readSheet('Messages', 'A2:C');
+        const messages = data.map(row => ({
+            text: row[0] || '',
+            category: row[1] || '',
+            date: row[2] || ''
+        }));
         const itemsPerPage = parseInt(localStorage.getItem('itemsPerPage')) || 10;
         const filteredMessages = messages.filter(m => m.category === category).slice(0, itemsPerPage);
         const list = document.getElementById('messageList');
@@ -377,13 +474,7 @@ async function sendMessage() {
     }
     try {
         document.body.classList.add('loading');
-        await axios.post(`${SHEETDB_API}?sheet=Messages`, {
-            data: [{
-                text,
-                category: 'sent',
-                date: new Date().toISOString()
-            }]
-        });
+        await appendToSheet('Messages', [text, 'sent', new Date().toISOString()]);
         input.value = '';
         await loadMessages();
         showToast('Message sent');
@@ -398,17 +489,11 @@ async function sendMessage() {
 async function replyMessage(index) {
     try {
         document.body.classList.add('loading');
-        const messages = (await axios.get(`${SHEETDB_API}?sheet=Messages`)).data;
-        const original = messages[index];
-        const replyText = prompt('Enter your reply:', `Re: ${original.text}`);
+        const data = await readSheet('Messages', 'A2:C');
+        const original = data[index];
+        const replyText = prompt('Enter your reply:', `Re: ${original[0]}`);
         if (replyText) {
-            await axios.post(`${SHEETDB_API}?sheet=Messages`, {
-                data: [{
-                    text: replyText,
-                    category: 'sent',
-                    date: newasciDate().toISOString()
-                }]
-            });
+            await appendToSheet('Messages', [replyText, 'sent', new Date().toISOString()]);
             await loadMessages();
             showToast('Reply sent');
         }
@@ -423,9 +508,8 @@ async function replyMessage(index) {
 async function deleteMessage(index) {
     try {
         document.body.classList.add('loading');
-        const messages = (await axios.get(`${SHEETDB_API}?sheet=Messages`)).data;
-        const message = messages[index];
-        await axios.delete(`${SHEETDB_API}/text/${encodeURIComponent(message.text)}?sheet=Messages`);
+        const rowIndex = index + 2;
+        await deleteRow('Messages', rowIndex - 1);
         await loadMessages();
         showToast('Message deleted');
     } catch (error) {
@@ -537,14 +621,14 @@ function loadSettings() {
 async function updateScoreCards() {
     try {
         const [customers, tasks, messages] = await Promise.all([
-            axios.get(`${SHEETDB_API}?sheet=Customers`).then(res => res.data),
-            axios.get(`${SHEETDB_API}?sheet=Tasks`).then(res => res.data),
-            axios.get(`${SHEETDB_API}?sheet=Messages`).then(res => res.data)
+            readSheet('Customers', 'A2:C'),
+            readSheet('Tasks', 'A2:C'),
+            readSheet('Messages', 'A2:C')
         ]);
 
         document.getElementById('totalCustomers').textContent = customers.length;
-        document.getElementById('tasksCompleted').textContent = tasks.filter(t => t.completed).length;
-        document.getElementById('messagesSent').textContent = messages.filter(m => m.category === 'sent').length;
+        document.getElementById('tasksCompleted').textContent = tasks.filter(t => t[1] === 'TRUE').length;
+        document.getElementById('messagesSent').textContent = messages.filter(m => m[1] === 'sent').length;
     } catch (error) {
         showToast('Failed to update score cards', true);
         console.error('Update score cards error:', error);
@@ -639,7 +723,7 @@ function updateChart() {
 }
 
 // Initialize
-window.onload = async () => {
+async function initializeDashboard() {
     document.body.classList.add('loading');
     try {
         await Promise.all([
@@ -658,4 +742,8 @@ window.onload = async () => {
             document.body.classList.remove('loading');
         }, 500);
     }
+}
+
+window.onload = () => {
+    initGoogleAPI();
 };
